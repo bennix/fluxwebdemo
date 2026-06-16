@@ -1,0 +1,16 @@
+{
+  "name": "fluxwebdemo",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/obfuscate-client.mjs",
+    "prestart": "npm run build",
+    "start": "node server.mjs",
+    "pretest": "npm run build",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

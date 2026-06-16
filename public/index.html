@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>FLUX Web Demo</title>
+  <link rel="stylesheet" href="/flux.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">FLUX Web Demo</div>
+    <div class="subtitle">Node runtime · server-held answer · one-shot challenge</div>
+  </header>
+
+  <main class="shell">
+    <section class="stage" aria-label="FLUX puzzle">
+      <canvas id="board" width="440" height="440"></canvas>
+      <div class="result" id="result">
+        <div class="resultIcon"><svg viewBox="0 0 24 24"><path id="resultPath" d="M5 13l4 4L19 7"/></svg></div>
+        <div class="resultTitle" id="resultTitle"></div>
+        <div class="resultText" id="resultText"></div>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <section class="card">
+        <h2>ASCII 邻位提示</h2>
+        <div class="hints" id="hints"></div>
+      </section>
+      <section class="card">
+        <h2>人机轨迹</h2>
+        <div class="riskText" id="riskText">等待拖拽</div>
+        <div class="meter"><i id="riskBar"></i></div>
+      </section>
+      <section class="card">
+        <h2>状态</h2>
+        <div class="note" id="status">正在领取挑战...</div>
+      </section>
+    </aside>
+  </main>
+
+  <nav class="actions">
+    <button id="verify" type="button">验证</button>
+    <button id="reset" type="button">重新挑战</button>
+    <button id="attack" class="ghost" type="button">模拟边界匹配攻击</button>
+  </nav>
+
+  <script src="/flux.js"></script>
+</body>
+</html>
