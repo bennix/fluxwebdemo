@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildSecurityHeaders, enforceRate, issueChallenge, verifyChallenge } from "./flux-core.mjs";
+import { auditEvent, buildSecurityHeaders, enforceRate, issueChallenge, verifyChallenge } from "./flux-core.mjs";
 import { storageMode } from "./store.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -37,17 +37,30 @@ export async function readJson(req) {
 }
 
 export async function handleChallenge(req, res) {
-  const limited = await enforceRate(req, "challenge");
-  if (limited.limited) return sendJson(res, 429, { pass: false, reason: "rate_limited" }, { "Retry-After": String(limited.retryAfter) });
-  const challenge = await issueChallenge(req, res);
+  const limited = await enforceRate(req, res, "challenge");
+  if (limited.limited) {
+    auditEvent(req, "rate_limited", { bucket: "challenge", retry_after: limited.retryAfter });
+    return sendJson(res, 429, { pass: false, reason: "rate_limited" }, { "Retry-After": String(limited.retryAfter) });
+  }
+  const payload = await readJson(req);
+  const challenge = await issueChallenge(req, res, payload);
+  auditEvent(req, "challenge_issued", { challenge_id: challenge.challenge_id });
   return sendJson(res, 200, challenge);
 }
 
 export async function handleVerify(req, res) {
-  const limited = await enforceRate(req, "verify");
-  if (limited.limited) return sendJson(res, 429, { pass: false, reason: "rate_limited" }, { "Retry-After": String(limited.retryAfter) });
+  const limited = await enforceRate(req, res, "verify");
+  if (limited.limited) {
+    auditEvent(req, "rate_limited", { bucket: "verify", retry_after: limited.retryAfter });
+    return sendJson(res, 429, { pass: false, reason: "rate_limited" }, { "Retry-After": String(limited.retryAfter) });
+  }
   const payload = await readJson(req);
   const result = await verifyChallenge(req, payload);
+  auditEvent(req, result.body?.pass ? "verify_passed" : "verify_failed", {
+    challenge_id: String(payload?.challenge_id || ""),
+    status: result.status,
+    public_reason: result.body?.reason || ""
+  });
   return sendJson(res, result.status, result.body);
 }
 

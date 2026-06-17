@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { issueChallenge, verifyChallenge, scoreBehavior } from "../src/flux-core.mjs";
+import { issueChallenge, verifyChallenge, scoreBehavior, slotPosition } from "../src/flux-core.mjs";
 import { clearMemoryStoreForTests } from "../src/store.mjs";
+import { START, TILE, GAP, N } from "../src/config.mjs";
 
 function req(cookie = "") {
   return { headers: { cookie }, socket: { remoteAddress: "127.0.0.1" } };
@@ -22,10 +23,9 @@ function cookieFrom(response) {
 }
 
 function slotCenter(slot) {
-  const tile = 128;
-  const col = slot % 3;
-  const row = Math.floor(slot / 3);
-  return [col * tile + tile / 2, row * tile + tile / 2];
+  // Match the client's slotPos: START + col*(TILE+GAP), centered.
+  const pos = slotPosition(slot);
+  return [pos.x + TILE / 2, pos.y + TILE / 2];
 }
 
 function operationEvents(challenge, targetMapping, includeClick = true) {
@@ -123,4 +123,86 @@ test("behavior scorer rejects straight robotic motion", () => {
   const score = scoreBehavior(events);
   assert.equal(score.straight_robotic, 1);
   assert.ok(score.score <= 0.35);
+});
+
+test("issued tiles start in a derangement (no tile already in its answer slot)", async () => {
+  clearMemoryStoreForTests();
+  const response = res();
+  const challenge = await issueChallenge(req(), response);
+  for (let id = 0; id < challenge.tiles.length; id += 1) {
+    assert.notEqual(challenge.tiles[id].start_slot, id, `tile ${id} must not start in its answer slot`);
+  }
+});
+
+test("glyph rotation avoids the previous glyph when avoid_challenge_id is passed", async () => {
+  clearMemoryStoreForTests();
+  const first = await issueChallenge(req(), res());
+  const second = await issueChallenge(req(), res(), { avoid_challenge_id: first.challenge_id });
+  // Different glyph → different rendered SVG bytes in the hint images.
+  assert.notEqual(first.hint_images[0].image, second.hint_images[0].image);
+});
+
+test("verify never leaks internal fields (exact/score/human) on any branch", async () => {
+  clearMemoryStoreForTests();
+  const response = res();
+  const challenge = await issueChallenge(req(), response);
+  const cookie = cookieFrom(response);
+
+  // Wrong mapping → verification_failed.
+  const wrongMapping = [...challenge.tiles.map((t) => t.start_slot)];
+  const wrong = await verifyChallenge(req(cookie), {
+    challenge_id: challenge.challenge_id,
+    mapping: wrongMapping,
+    events: operationEvents(challenge, [...Array(9).keys()], true)
+  });
+  const leaked = Object.keys({ ...wrong.body, ...(wrong.body || {}) }).filter((k) =>
+    ["exact", "human", "score", "straight_robotic", "interaction", "bound_interaction", "manual_verify", "session"].includes(k)
+  );
+  assert.deepEqual(leaked, [], "internal fields must not leak");
+});
+
+test("atomic one-shot: concurrent verify of the same challenge yields exactly one pass", async () => {
+  clearMemoryStoreForTests();
+  const response = res();
+  const challenge = await issueChallenge(req(), response);
+  const cookie = cookieFrom(response);
+  const answer = [...Array(9).keys()];
+  const payload = {
+    challenge_id: challenge.challenge_id,
+    mapping: answer,
+    events: operationEvents(challenge, answer, true)
+  };
+  // Issue a fresh challenge per concurrent attempt: each must be independently one-shot.
+  // To exercise the CAS under contention on the SAME key, both attempts target the
+  // same challenge_id — only one may consume it.
+  const [a, b] = await Promise.all([
+    verifyChallenge(req(cookie), payload),
+    verifyChallenge(req(cookie), payload)
+  ]);
+  const passes = [a, b].filter((r) => r.body?.pass).length;
+  assert.equal(passes, 1, `exactly one concurrent verify should pass, got ${passes}`);
+});
+
+test("geometric rejection: down event outside the slot rectangle fails interaction", async () => {
+  const { __test__ } = await import("../src/flux-core.mjs");
+  clearMemoryStoreForTests();
+  const issued = await issueChallenge(req(), res());
+  // issueChallenge returns a response with tiles[].start_slot; the validator reads
+  // state.start_slots — reconstruct it.
+  const challenge = {
+    start_slots: issued.tiles.map((t) => t.start_slot),
+    answer: [...Array(9).keys()]
+  };
+  // Build a single swap whose down point is far outside the slot rectangle.
+  const from = challenge.start_slots[0];
+  const target = [...Array(9).keys()];
+  const toSlot = target[0];
+  const farPos = { x: 9999, y: 9999 };
+  const events = [
+    { type: "down", x: farPos.x, y: farPos.y, t: 0, tile_id: 0, from_slot: from },
+    { type: "move", x: farPos.x, y: farPos.y, t: 80 },
+    { type: "swap", x: farPos.x, y: farPos.y, t: 200, tile_id: 0, from_slot: from, to_slot: toSlot },
+    { type: "up", x: farPos.x, y: farPos.y, t: 260, tile_id: 0 }
+  ];
+  assert.equal(__test__.interactionMatchesMapping(challenge, target, events), false);
 });

@@ -13,10 +13,11 @@ import {
   RATE_LIMITS,
   RATE_LIMIT_WINDOW_SECONDS,
   SOFT_BEHAVIOR_PASS_THRESHOLD,
+  START,
   TILE,
   TTL_SECONDS
 } from "./config.mjs";
-import { getChallenge, incrWithTtl, replaceChallenge, saveChallenge } from "./store.mjs";
+import { commitVerify, getChallenge, getChallengeRaw, incrWithTtl, saveChallenge, serializeChallenge } from "./store.mjs";
 
 function nowSeconds() {
   return Date.now() / 1000;
@@ -71,6 +72,14 @@ function shuffle(values) {
   return out;
 }
 
+function shuffledDerangement(size) {
+  let out = shuffle([...Array(size).keys()]);
+  while (out.some((value, index) => value === index)) {
+    out = shuffle([...Array(size).keys()]);
+  }
+  return out;
+}
+
 function escapeXml(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[ch]);
 }
@@ -81,6 +90,13 @@ function svgDataUrl(svg) {
 
 function slotXY(slot) {
   return { x: (slot % N) * TILE, y: Math.floor(slot / N) * TILE };
+}
+
+// Screen-space top-left of a board slot, matching the client's slotPos and the patent's slot_position.
+export function slotPosition(slot) {
+  const col = slot % N;
+  const row = Math.floor(slot / N);
+  return { x: START + col * (TILE + GAP), y: START + row * (TILE + GAP) };
 }
 
 function makeTileSvg(glyph, sourceSlot, seed, phase) {
@@ -170,20 +186,49 @@ function clientIp(req) {
   return (raw ? raw.split(",")[0].trim() : req.socket?.remoteAddress || "local").replace(/^::ffff:/, "");
 }
 
-export async function enforceRate(req, bucket) {
+export async function enforceRate(req, res, bucket) {
   const ip = clientIp(req);
-  const count = await incrWithTtl(`${bucket}:${ip}`, RATE_LIMIT_WINDOW_SECONDS);
+  const sessionId = currentSession(req);
+  const windowSeconds = RATE_LIMIT_WINDOW_SECONDS;
   const limit = RATE_LIMITS[bucket] || 60;
-  if (count > limit) return { limited: true, status: 429, retryAfter: RATE_LIMIT_WINDOW_SECONDS };
+  // Patent: rate-limit on both IP and session so a single IP cannot rotate sessions to bypass.
+  const buckets = [["ip", ip]];
+  if (sessionId) buckets.push(["session", sessionId]);
+  let retryAfter = 0;
+  let limited = false;
+  for (const [scope, value] of buckets) {
+    const count = await incrWithTtl(`${bucket}:${scope}:${value}`, windowSeconds);
+    if (count > limit) {
+      limited = true;
+      retryAfter = Math.max(retryAfter, windowSeconds);
+    }
+  }
+  if (limited) return { limited: true, status: 429, retryAfter };
   return { limited: false };
 }
 
-export async function issueChallenge(req, res) {
+export async function issueChallenge(req, res, payload = {}) {
   const session_id = getOrCreateSession(req, res);
-  const glyph = GLYPHS[randInt(GLYPHS.length)];
+  // Patent anti-replay: if the client passes a previous challenge_id, avoid repeating its glyph.
+  let avoidGlyph = null;
+  const avoidId = String(payload?.avoid_challenge_id || "");
+  if (avoidId) {
+    const previous = await getChallenge(avoidId);
+    if (previous?.glyph) avoidGlyph = previous.glyph;
+  }
+  const pool = GLYPHS;
+  let glyph;
+  if (avoidGlyph && pool.length > 1) {
+    do {
+      glyph = pool[randInt(pool.length)];
+    } while (glyph === avoidGlyph);
+  } else {
+    glyph = pool[randInt(pool.length)];
+  }
   const seed = randInt(9999) + 1;
   const phase = crypto.randomBytes(4).readUInt32BE(0) / 0xffffffff * Math.PI * 2;
-  const startSlots = shuffle([...Array(M).keys()]);
+  // Patent: start slots must be a derangement so no tile is already in its answer slot.
+  const startSlots = shuffledDerangement(M);
   const now = nowSeconds();
   const state = {
     v: 1,
@@ -355,7 +400,9 @@ function interactionMatchesMapping(challenge, mapping, events) {
   if (!validMapping(mapping) || core === null) return false;
   const tileToSlot = new Map();
   const slotToTile = new Map();
+  const issued = new Set();
   for (let id = 0; id < M; id += 1) {
+    issued.add(id);
     const slot = challenge.start_slots[id];
     tileToSlot.set(id, slot);
     slotToTile.set(slot, id);
@@ -370,8 +417,14 @@ function interactionMatchesMapping(challenge, mapping, events) {
       if (active) return false;
       const tile_id = eventInt(item, "tile_id");
       const from_slot = eventInt(item, "from_slot");
-      if (tile_id === null || from_slot === null || tileToSlot.get(tile_id) !== from_slot) return false;
-      active = { tile_id, moves: 0 };
+      const dx = eventNumber(item, "x");
+      const dy = eventNumber(item, "y");
+      if (tile_id === null || !issued.has(tile_id) || from_slot === null || tileToSlot.get(tile_id) !== from_slot) return false;
+      if (dx === null || dy === null) return false;
+      // Patent: the grab point must land inside (or within a 4px slack of) the source slot rectangle.
+      const pos = slotPosition(from_slot);
+      if (!(pos.x - 4 <= dx && dx <= pos.x + TILE + 4 && pos.y - 4 <= dy && dy <= pos.y + TILE + 4)) return false;
+      active = { tile_id, moves: 0, grab_x: dx - pos.x, grab_y: dy - pos.y };
     } else if (item.type === "move") {
       if (active) active.moves += 1;
     } else if (item.type === "swap") {
@@ -379,7 +432,17 @@ function interactionMatchesMapping(challenge, mapping, events) {
       const tile_id = eventInt(item, "tile_id");
       const from_slot = eventInt(item, "from_slot");
       const to_slot = eventInt(item, "to_slot");
+      const sx = eventNumber(item, "x");
+      const sy = eventNumber(item, "y");
       if (tile_id !== active.tile_id || from_slot === null || to_slot === null || tileToSlot.get(tile_id) !== from_slot) return false;
+      if (sx === null || sy === null) return false;
+      // Patent: drag center must be within TILE*0.82 of the target slot center.
+      const center_x = sx - active.grab_x + TILE / 2;
+      const center_y = sy - active.grab_y + TILE / 2;
+      const target = slotPosition(to_slot);
+      const targetCx = target.x + TILE / 2;
+      const targetCy = target.y + TILE / 2;
+      if (Math.hypot(center_x - targetCx, center_y - targetCy) > TILE * 0.82) return false;
       const other = slotToTile.get(to_slot);
       if (other === undefined || other === tile_id) return false;
       tileToSlot.set(tile_id, to_slot);
@@ -425,39 +488,83 @@ export async function verifyChallenge(req, payload) {
   const challengeId = String(payload?.challenge_id || "");
   const mapping = payload?.mapping;
   const events = payload?.events;
+
   let challenge = await getChallenge(challengeId);
   if (!challenge) challenge = decryptState(challengeId);
   if (!challenge || challenge.used || challenge.locked || nowSeconds() > challenge.expires_at) {
     return { status: challenge ? 400 : 404, body: publicFailure("challenge_unavailable") };
   }
   if (!validMapping(mapping)) return { status: 400, body: publicFailure("verification_failed") };
-  challenge.attempts = (challenge.attempts || 0) + 1;
-  const exact = mapping.every((slot, id) => slot === challenge.answer[id]);
+
+  // Read the canonical stored blob to use as the CAS guard. Prefer Redis raw; fall back
+  // to a deterministic serialization of the in-memory/decrypted state.
+  const prevRaw = (await getChallengeRaw(challengeId)) || serializeChallenge(challenge);
+
+  // Pure evaluation against a snapshot — no store writes happen here.
   const behavior = scoreBehavior(events);
+  const exact = mapping.every((slot, id) => slot === challenge.answer[id]);
   const interaction = interactionMatchesMapping(challenge, mapping, events);
   const boundInteraction = interaction || hasBoundInteractionEvents(challenge, events);
   const manualVerify = hasManualVerifyIntent(events);
-  const sessionOk = challenge.session_id && challenge.session_id === currentSession(req);
+  const sessionOk = Boolean(challenge.session_id) && challenge.session_id === currentSession(req);
   const strongHuman = behavior.score >= BEHAVIOR_PASS_THRESHOLD;
   const softHuman = behavior.score >= SOFT_BEHAVIOR_PASS_THRESHOLD && !behavior.straight_robotic;
   const human = Boolean(manualVerify && sessionOk && boundInteraction && (strongHuman || (interaction && softHuman)));
-  if (exact && human) {
+  const passed = Boolean(exact && human);
+
+  challenge.attempts = (challenge.attempts || 0) + 1;
+  // Preserve the original demo semantics: a locked challenge returns 429 only on the
+  // attempt AFTER the limit is hit (attempts > limit), so the first failed attempt on
+  // a fresh challenge still returns 200. Locking still happens at attempts >= limit.
+  const wasLocked = Boolean(challenge.locked);
+  if (!passed) {
+    challenge.failures = (challenge.failures || 0) + 1;
+    if (challenge.failures >= MAX_FAILURES_PER_CHALLENGE || challenge.attempts >= MAX_VERIFY_ATTEMPTS_PER_CHALLENGE) {
+      challenge.locked = true;
+    }
+  } else {
     challenge.used = true;
-    const ttl = Math.max(1, Math.floor(challenge.expires_at - nowSeconds()));
-    await replaceChallenge(challenge, ttl);
-    return { status: 200, body: { pass: true } };
   }
-  challenge.failures = (challenge.failures || 0) + 1;
-  if (challenge.failures >= MAX_FAILURES_PER_CHALLENGE || challenge.attempts >= MAX_VERIFY_ATTEMPTS_PER_CHALLENGE) {
-    challenge.locked = true;
-  }
-  const ttl = Math.max(1, Math.floor(challenge.expires_at - nowSeconds()));
-  await replaceChallenge(challenge, ttl);
-  if (challenge.locked && challenge.attempts > MAX_VERIFY_ATTEMPTS_PER_CHALLENGE) {
+  const ttlSeconds = Math.max(1, Math.floor(challenge.expires_at - nowSeconds()));
+
+  const outcome = await commitVerify({
+    challengeId,
+    prevRaw,
+    newState: challenge,
+    passed,
+    ttlSeconds
+  });
+
+  if (outcome === "missing") return { status: 404, body: publicFailure("challenge_unavailable") };
+  // Concurrent verify raced us: surface a neutral failure without revealing internal state.
+  if (outcome === "conflict") return { status: 200, body: publicFailure("verification_failed") };
+  if (outcome === "passed") return { status: 200, body: { pass: true } };
+  // outcome === "failed"
+  if (wasLocked && challenge.attempts > MAX_VERIFY_ATTEMPTS_PER_CHALLENGE) {
     return { status: 429, body: publicFailure("too_many_attempts") };
   }
   return { status: 200, body: publicFailure("verification_failed") };
 }
+
+// Lightweight audit log: one JSON line per event on stdout, which Vercel ingests.
+// Never includes mapping/events payloads or internal scores — only categorical facts.
+export function auditEvent(req, event, fields = {}) {
+  try {
+    const record = {
+      ts: Number(nowSeconds().toFixed(3)),
+      event,
+      ip: clientIp(req),
+      path: req.url ? new URL(req.url, "http://localhost").pathname : "",
+      ...fields
+    };
+    console.info(JSON.stringify(record));
+  } catch {
+    // Audit must never break a request.
+  }
+}
+
+// Exposed for tests only — not part of the public API.
+export const __test__ = { interactionMatchesMapping };
 
 export function buildSecurityHeaders() {
   return {
