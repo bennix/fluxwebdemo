@@ -122,7 +122,7 @@ test("behavior scorer rejects straight robotic motion", () => {
   ];
   const score = scoreBehavior(events);
   assert.equal(score.straight_robotic, 1);
-  assert.ok(score.score <= 0.35);
+  assert.ok(score.score <= 0.24, `near-linear score must stay below soft-human threshold, got ${score.score}`);
 });
 
 test("issued tiles start in a derangement (no tile already in its answer slot)", async () => {

@@ -389,9 +389,12 @@ export function scoreBehavior(events) {
   const f5 = 0.45 <= span && span <= 90 ? 1 : 0;
   const f6 = Math.min(1, drags / 2);
   const f7 = Math.min(1, clean.length / 28);
-  const straightRobot = nl < 1.01 && pauses === 0 && reversals === 0;
+  const straightRobot = nl < 1.25 && pauses === 0 && reversals === 0;
   let score = Math.max(0, Math.min(1, 0.2 * f1 + 0.2 * f2 + 0.1 * f3 + 0.1 * f4 + 0.2 * f5 + 0.1 * f6 + 0.1 * f7));
-  if (straightRobot) score = Math.min(score, 0.35);
+  // Near-linear trajectories (even with small wobble that flips straight_robotic off via the
+  // old nl<1.01 test) must stay below the soft-human threshold so they cannot pair with a
+  // valid interaction to bypass. Cap below SOFT_BEHAVIOR_PASS_THRESHOLD.
+  if (straightRobot) score = Math.min(score, 0.24);
   return { score, straight_robotic: straightRobot ? 1 : 0 };
 }
 
